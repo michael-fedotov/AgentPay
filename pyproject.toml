@@ -18,6 +18,8 @@ dependencies = [
     "python-dotenv",
     "openai",
     "jinja2",
+    "agentmail",
+    "google-generativeai",
 ]
 
 [project.optional-dependencies]
