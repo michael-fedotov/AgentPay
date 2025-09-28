@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InboxPay Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>InboxPay Dashboard</h1>
+            <p>Inbox-based payment processing system</p>
+        </header>
+
+        <main>
+            <div class="dashboard-grid">
+                <div class="card">
+                    <h2>Recent Bills</h2>
+                    <p>No bills yet. Send your first bill to get started!</p>
+                </div>
+
+                <div class="card">
+                    <h2>Payment Status</h2>
+                    <p>All payments are up to date.</p>
+                </div>
+
+                <div class="card">
+                    <h2>System Health</h2>
+                    <p>All systems operational.</p>
+                </div>
+
+                <div class="card">
+                    <h2>Quick Actions</h2>
+                    <button class="btn btn-primary">Send Test Bill</button>
+                    <button class="btn btn-secondary">View Logs</button>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <p>&copy; 2025 InboxPay FastAPI</p>
+        </footer>
+    </div>
+</body>
+</html>
