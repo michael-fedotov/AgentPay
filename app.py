@@ -553,7 +553,13 @@ async def process_incoming_message(db: Session, event_data: Dict[str, Any]) -> D
         inbox_id = event_data.get("inbox_id")
         message_id = event_data.get("message_id")
         from_email_list = event_data.get("from")
-        from_email = from_email_list[0] if isinstance(from_email_list, list) and from_email_list else from_email_list
+        from_email_raw = from_email_list[0] if isinstance(from_email_list, list) and from_email_list else from_email_list
+        
+        # Extract just the email address from "Name <email@domain.com>" format
+        import re
+        email_match = re.search(r'<([^>]+)>', from_email_raw)
+        from_email = email_match.group(1) if email_match else from_email_raw
+        
         subject = event_data.get("subject", "")
         
         print(f"📧 Processing message: {message_id} from {from_email}")
@@ -594,6 +600,49 @@ async def process_incoming_message(db: Session, event_data: Dict[str, Any]) -> D
                 "message": "Email processed but not identified as a bill",
                 "bill_detected": False
             }
+        
+        # Check if bill already exists (idempotency)
+        existing_bill = db.query(Bill).filter(Bill.message_id == message_id).first()
+        if existing_bill:
+            print(f"📋 Bill already processed: {existing_bill.id}")
+            # If bill exists but no confirmation was sent, try to send it now
+            if not existing_bill.status == "confirmed_sent":
+                print(f"🔄 Attempting to send confirmation for existing bill...")
+                payment_result = {"success": True, "dry_run": True} if existing_bill.amount_cents else None
+                confirmation_result = await send_bill_confirmation(
+                    inbox_id=inbox_id,
+                    to_email=from_email,
+                    bill=existing_bill,
+                    payment_result=payment_result
+                )
+                if confirmation_result.get("success"):
+                    existing_bill.status = "confirmed_sent"
+                    db.commit()
+                    print(f"✅ Confirmation sent for existing bill!")
+                
+                return {
+                    "success": True,
+                    "bill_id": existing_bill.id,
+                    "bill_detected": True,
+                    "amount_cents": existing_bill.amount_cents,
+                    "payee": existing_bill.payee,
+                    "due_date": existing_bill.due_date,
+                    "payment_processed": True,
+                    "confirmation_sent": confirmation_result.get("success", False),
+                    "note": "Bill already existed, confirmation attempted"
+                }
+            else:
+                return {
+                    "success": True,
+                    "bill_id": existing_bill.id,
+                    "bill_detected": True,
+                    "amount_cents": existing_bill.amount_cents,
+                    "payee": existing_bill.payee,
+                    "due_date": existing_bill.due_date,
+                    "payment_processed": True,
+                    "confirmation_sent": True,
+                    "note": "Bill already processed and confirmed"
+                }
         
         # Save bill to database
         bill = create_bill_record(
@@ -773,6 +822,9 @@ async def send_bill_confirmation(inbox_id: str, to_email: str, bill: Bill,
         
         subject = f"AgentPay: {status} - {bill.payee or 'Bill Processed'}"
         
+        # Format amount safely
+        amount_display = f"${bill.amount_cents/100:.2f}" if bill.amount_cents else "Not specified"
+        
         text_content = f"""
 Hello,
 
@@ -780,7 +832,7 @@ Your bill has been processed by AgentPay:
 
 Bill Details:
 - Payee: {bill.payee or 'Not specified'}
-- Amount: ${bill.amount_cents/100:.2f if bill.amount_cents else 'Not specified'}
+- Amount: {amount_display}
 - Due Date: {bill.due_date.strftime('%Y-%m-%d') if bill.due_date else 'Not specified'}
 - Status: {status}
 
