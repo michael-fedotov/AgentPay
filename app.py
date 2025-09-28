@@ -54,8 +54,13 @@ agentmail_client = AgentMail(api_key=settings.agentmail_api_key)
 # Initialize Gemini client if API key is available
 gemini_client = None
 if GEMINI_AVAILABLE and settings.gemini_api_key:
-    genai.configure(api_key=settings.gemini_api_key)
-    gemini_client = genai.GenerativeModel('gemini-pro')
+    try:
+        genai.configure(api_key=settings.gemini_api_key)
+        gemini_client = genai.GenerativeModel('gemini-flash-latest')
+        print("✅ Gemini client initialized successfully with gemini-flash-latest")
+    except Exception as e:
+        print(f"⚠️ Failed to initialize Gemini client: {e}")
+        GEMINI_AVAILABLE = False
 
 # Global HTTP client
 httpx_client = httpx.AsyncClient(timeout=15.0)
@@ -192,10 +197,10 @@ async def llm_extract(email_text: str) -> Dict[str, Any]:
         print("⚠️ Gemini client not available, using regex fallback")
         return regex_fallback(email_text)
     
-    system_prompt = """You are a deterministic bill parser. Output ONLY valid JSON:
+    system_prompt = """Parse this document and return JSON with these fields:
 {"payee": string, "amount_cents": number, "due_date_iso": string|null}
-Rules: normalize amount to cents (pick smallest positive Amount Due/Total Due).
-due_date_iso is YYYY-MM-DD or null. Derive payee from headers/brand. No extra text."""
+Convert dollar amounts to cents. Use YYYY-MM-DD format for dates or null if no date found.
+Extract company name for payee field. Return only the JSON object."""
     
     user_prompt = f"Extract bill fields from this email:\n---BEGIN---\n{email_text}\n---END---"
     
@@ -203,65 +208,101 @@ due_date_iso is YYYY-MM-DD or null. Derive payee from headers/brand. No extra te
         # Combine system and user prompts for Gemini
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
         
-        # Generate response from Gemini
-        response = await httpx_client.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
-            headers={
-                "Content-Type": "application/json",
-            },
-            params={"key": settings.gemini_api_key},
-            json={
-                "contents": [{
-                    "parts": [{"text": full_prompt}]
-                }],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 200
-                }
-            },
-            timeout=10.0
+        # Use the Gemini Python SDK with safety settings
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+        
+        response = gemini_client.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=200,
+                candidate_count=1
+            ),
+            safety_settings=safety_settings
         )
         
-        if response.status_code == 200:
-            result = response.json()
-            if "candidates" in result and len(result["candidates"]) > 0:
-                generated_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Handle response more carefully
+        if response and response.candidates:
+            candidate = response.candidates[0]
+            print(f"🔍 Debug - Finish reason: {candidate.finish_reason}")
+            print(f"🔍 Debug - Has content: {hasattr(candidate, 'content')}")
+            if hasattr(candidate, 'content'):
+                print(f"🔍 Debug - Content: {candidate.content}")
+                print(f"🔍 Debug - Has parts: {hasattr(candidate.content, 'parts')}")
+                if hasattr(candidate.content, 'parts'):
+                    print(f"🔍 Debug - Parts count: {len(candidate.content.parts) if candidate.content.parts else 0}")
+            
+            # Check if response was blocked
+            if candidate.finish_reason.name in ['SAFETY', 'BLOCKED']:
+                print(f"⚠️ Gemini response blocked due to safety filters: {candidate.finish_reason.name}")
+                print("   This is likely a false positive for bill content")
+                generated_text = None
+            elif hasattr(candidate.content, 'parts') and candidate.content.parts:
+                generated_text = candidate.content.parts[0].text.strip()
                 
-                # Try to parse as JSON
-                try:
-                    parsed_data = json.loads(generated_text)
-                    
-                    # Validate the required fields exist and have correct types
-                    if (isinstance(parsed_data, dict) and 
-                        "payee" in parsed_data and 
-                        "amount_cents" in parsed_data and 
-                        "due_date_iso" in parsed_data):
-                        
-                        # Ensure amount_cents is an integer or can be converted
-                        if parsed_data["amount_cents"] is not None:
-                            try:
-                                parsed_data["amount_cents"] = int(parsed_data["amount_cents"])
-                            except (ValueError, TypeError):
-                                parsed_data["amount_cents"] = None
-                        
-                        # Ensure due_date_iso is string or null
-                        if parsed_data["due_date_iso"] is not None and not isinstance(parsed_data["due_date_iso"], str):
-                            parsed_data["due_date_iso"] = None
-                        
-                        print(f"✅ LLM extraction successful: {parsed_data}")
-                        return parsed_data
-                    else:
-                        print("⚠️ LLM response missing required fields, using regex fallback")
+                # Remove markdown code blocks if present
+                if generated_text.startswith('```json') and generated_text.endswith('```'):
+                    generated_text = generated_text[7:-3].strip()
+                elif generated_text.startswith('```') and generated_text.endswith('```'):
+                    generated_text = generated_text[3:-3].strip()
                 
-                except json.JSONDecodeError as e:
-                    print(f"⚠️ LLM response not valid JSON: {e}, using regex fallback")
+                print(f"🤖 Gemini response: {generated_text}")
             else:
-                print("⚠️ No candidates in LLM response, using regex fallback")
+                print("⚠️ No text content in Gemini response")
+                generated_text = None
+        elif response and hasattr(response, 'text'):
+            try:
+                generated_text = response.text.strip()
+                print(f"🤖 Gemini response: {generated_text}")
+            except ValueError as e:
+                print(f"⚠️ Could not access response text: {e}")
+                generated_text = None
         else:
-            print(f"⚠️ LLM API error {response.status_code}, using regex fallback")
+            print("⚠️ No valid response from Gemini")
+            generated_text = None
+        
+        if generated_text:
+            # Try to parse as JSON
+            try:
+                parsed_data = json.loads(generated_text)
+                
+                # Validate the required fields exist and have correct types
+                if (isinstance(parsed_data, dict) and 
+                    "payee" in parsed_data and 
+                    "amount_cents" in parsed_data and 
+                    "due_date_iso" in parsed_data):
+                    
+                    # Ensure amount_cents is an integer or can be converted
+                    if parsed_data["amount_cents"] is not None:
+                        try:
+                            parsed_data["amount_cents"] = int(parsed_data["amount_cents"])
+                        except (ValueError, TypeError):
+                            parsed_data["amount_cents"] = None
+                    
+                    # Ensure due_date_iso is string or null
+                    if parsed_data["due_date_iso"] is not None and not isinstance(parsed_data["due_date_iso"], str):
+                        parsed_data["due_date_iso"] = None
+                    
+                    print(f"✅ Gemini extraction successful: {parsed_data}")
+                    return parsed_data
+                else:
+                    print("⚠️ Gemini response missing required fields, using regex fallback")
+            
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Gemini response not valid JSON: {e}, using regex fallback")
+                print(f"   Raw response: {generated_text}")
+        else:
+            print("⚠️ No valid text from Gemini, using regex fallback")
     
     except Exception as e:
-        print(f"⚠️ LLM extraction failed: {e}, using regex fallback")
+        print(f"⚠️ Gemini extraction failed: {e}, using regex fallback")
+        import traceback
+        traceback.print_exc()
     
     # Fallback to regex extraction
     return regex_fallback(email_text)
@@ -511,7 +552,8 @@ async def process_incoming_message(db: Session, event_data: Dict[str, Any]) -> D
         # Extract message details from webhook
         inbox_id = event_data.get("inbox_id")
         message_id = event_data.get("message_id")
-        from_email = event_data.get("from")
+        from_email_list = event_data.get("from")
+        from_email = from_email_list[0] if isinstance(from_email_list, list) and from_email_list else from_email_list
         subject = event_data.get("subject", "")
         
         print(f"📧 Processing message: {message_id} from {from_email}")
